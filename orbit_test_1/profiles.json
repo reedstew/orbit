@@ -1,0 +1,16 @@
+{
+  "A3B12F": {
+    "id": "A3B12F",
+    "name": "Reed Stewart",
+    "bio": "CMU Heinz Grad | Public Policy & IS",
+    "techStack": ["SwiftUI", "C#", "NoSQL"],
+    "linkedIn": "linkedin.com/in/reedstewart"
+  },
+  "B22C91": {
+    "id": "B22C91",
+    "name": "Aditi",
+    "bio": "Product Designer @ Orbit",
+    "techStack": ["Figma", "React", "Python"],
+    "linkedIn": "linkedin.com/in/aditi-designer"
+  }
+}
