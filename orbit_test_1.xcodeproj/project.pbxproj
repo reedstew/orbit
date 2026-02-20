@@ -6,7 +6,12 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		9A9AB7B62F483E3A003FA5FB /* .gitignore in Sources */ = {isa = PBXBuildFile; fileRef = 9A9AB7B42F483E2E003FA5FB /* .gitignore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
+		9A9AB7B42F483E2E003FA5FB /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		9AE0D9D72F47923E00A509A0 /* orbit_test_1.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = orbit_test_1.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -34,6 +39,7 @@
 			children = (
 				9AE0D9D92F47923E00A509A0 /* orbit_test_1 */,
 				9AE0D9D82F47923E00A509A0 /* Products */,
+				9A9AB7B42F483E2E003FA5FB /* .gitignore */,
 			);
 			sourceTree = "<group>";
 		};
@@ -119,6 +125,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9A9AB7B62F483E3A003FA5FB /* .gitignore in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
