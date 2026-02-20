@@ -1,9 +1,15 @@
 import SwiftUI
 
+enum AppMode: String {
+    case peer  = "Peer"
+    case event = "Event"
+}
+
 struct HeaderView: View {
-    // Saves the toggle state permanently on the device
-    @AppStorage("isOpenToChat") private var isOpenToChat: Bool = true
-    
+    @AppStorage("appMode") private var appMode: String = AppMode.peer.rawValue
+
+    private var currentMode: AppMode { AppMode(rawValue: appMode) ?? .peer }
+
     var body: some View {
         HStack {
             // Logo and Title
@@ -15,36 +21,65 @@ struct HeaderView: View {
                     .font(.title2)
                     .bold()
             }
-            
+
             Spacer()
-            
-            // Interactive Status Badge
-            Button(action: {
-                // Adds a smooth color-fade animation when tapped
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isOpenToChat.toggle()
+
+            // Peer / Event mode toggle
+            HStack(spacing: 0) {
+                ForEach([AppMode.peer, AppMode.event], id: \.rawValue) { mode in
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            appMode = mode.rawValue
+                        }
+                    }) {
+                        HStack(spacing: 5) {
+                            Image(systemName: mode.iconName)
+                                .font(.caption)
+                            Text(mode.rawValue)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule().fill(currentMode == mode
+                                ? mode.accentColor.opacity(0.15)
+                                : Color.clear)
+                        )
+                        .foregroundColor(currentMode == mode ? mode.accentColor : .secondary)
+                    }
+                    .buttonStyle(PlainButtonStyle())
                 }
-            }) {
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(isOpenToChat ? Color.green : Color.gray)
-                        .frame(width: 8, height: 8)
-                    Text(isOpenToChat ? "Open to Chat" : "Heads Down")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .foregroundColor(isOpenToChat ? .green : .gray)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Capsule().fill(isOpenToChat ? Color.green.opacity(0.1) : Color.gray.opacity(0.1)))
-                .overlay(
-                    Capsule().stroke(isOpenToChat ? Color.green.opacity(0.2) : Color.gray.opacity(0.2), lineWidth: 1)
-                )
             }
-            .buttonStyle(PlainButtonStyle()) // Prevents the whole button from turning gray when pressed
+            .background(
+                Capsule()
+                    .fill(Color(UIColor.secondarySystemBackground))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(Color(UIColor.separator).opacity(0.4), lineWidth: 1)
+            )
         }
         .padding(.horizontal)
         .padding(.top, 10)
+    }
+}
+
+// MARK: - AppMode UI helpers
+
+extension AppMode {
+    var iconName: String {
+        switch self {
+        case .peer:  return "person.2.fill"
+        case .event: return "party.popper.fill"
+        }
+    }
+
+    var accentColor: Color {
+        switch self {
+        case .peer:  return .blue
+        case .event: return .purple
+        }
     }
 }
 

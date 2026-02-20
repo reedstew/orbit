@@ -44,11 +44,17 @@ class ConnectionCallHandler {
     /// Cleared after 30 minutes per the Orbit protocol spec.
     private var connectionCache: [String: (state: ConnectionState, timestamp: Date)] = [:]
 
-    /// Our own stable Hex ID (injected from BLEManager)
-    private let myHexID: String
+    /// Closure that returns this device's current user ID.
+    /// Using a closure (rather than a stored let) means it always reflects
+    /// whatever profile the user has selected in EditProfileView, even if
+    /// they change it after the handler was initialized.
+    private let myIDProvider: () -> String
 
-    init(myHexID: String) {
-        self.myHexID = myHexID
+    /// Convenience accessor
+    private var myHexID: String { myIDProvider() }
+
+    init(myIDProvider: @escaping () -> String) {
+        self.myIDProvider = myIDProvider
     }
 
     // MARK: - Incoming: Handle a parsed CC packet
@@ -60,18 +66,21 @@ class ConnectionCallHandler {
     func handle(packet: CCPacket) {
         let cacheKey = cacheKeyFor(fromID: packet.fromID, toID: packet.toID)
 
-        // --- 1. Dedup check: ignore if seen in the last 30 minutes ---
+        // Only dedup terminal states (accepted/rejected).
+        // A pending request should still show the sheet if it arrives again —
+        // the sender may be retrying because they haven't seen a response yet.
         if let cached = connectionCache[cacheKey] {
             let age = Date().timeIntervalSince(cached.timestamp)
-            if age < 1800 {
-                print("🔁 [CC] Duplicate from \(packet.fromID) — ignoring (cached state: \(cached.state.rawValue))")
+            let isTerminal = cached.state == .accepted || cached.state == .rejected
+            if isTerminal && age < 10 {
+                print("🔁 [CC] Already \(cached.state.rawValue) with \(packet.fromID) — ignoring")
                 return
             }
         }
 
-        // --- 2. Is this packet addressed to ME? ---
+        // Is this packet addressed to ME?
         guard packet.toID == myHexID else {
-            print("📭 [CC] Packet for \(packet.toID) — not us, ignoring")
+            print("📭 [CC] Packet for \(packet.toID) — not us (we are \(myHexID))")
             return
         }
 
@@ -87,8 +96,9 @@ class ConnectionCallHandler {
             delegate?.didReceiveConnectionRequest(from: packet)
 
         case .connectionAccept:
-            // The person we requested has accepted — notify the UI
+            // The person we requested has accepted — save and notify UI
             connectionCache[cacheKey] = (.accepted, Date())
+            ConnectionsStore.shared.addConnection(userID: packet.fromID)
             delegate?.didReceiveConnectionConfirmation(from: packet)
 
         case .connectionReject:
@@ -109,9 +119,9 @@ class ConnectionCallHandler {
     func sendConnectionRequest(myName: String, toHexID: String) {
         let cacheKey = cacheKeyFor(fromID: myHexID, toID: toHexID)
 
-        // Don't spam — check cache first
-        if let cached = connectionCache[cacheKey], Date().timeIntervalSince(cached.timestamp) < 1800 {
-            print("⚠️ [CC] Already sent a request to \(toHexID) recently — skipping")
+        // Don't spam — ignore retaps within 5 seconds
+        if let cached = connectionCache[cacheKey], Date().timeIntervalSince(cached.timestamp) < 10 {
+            print("⚠️ [CC] Request to \(toHexID) too recent — skipping")
             return
         }
 
@@ -143,6 +153,7 @@ class ConnectionCallHandler {
 
         let cacheKey = cacheKeyFor(fromID: myHexID, toID: toHexID)
         connectionCache[cacheKey] = (.accepted, Date())
+        ConnectionsStore.shared.addConnection(userID: toHexID)
 
         print("✅ [CC] Accepting connection from \(toHexID): \(payload)")
         delegate?.broadcastConnectionPacket(payload)
@@ -172,7 +183,7 @@ class ConnectionCallHandler {
     func purgeExpiredCache() {
         let now = Date()
         let before = connectionCache.count
-        connectionCache = connectionCache.filter { now.timeIntervalSince($0.value.timestamp) < 1800 }
+        connectionCache = connectionCache.filter { now.timeIntervalSince($0.value.timestamp) < 10 }
         let purged = before - connectionCache.count
         if purged > 0 { print("🗑️ [CC] Purged \(purged) expired cache entries") }
     }
@@ -205,11 +216,14 @@ class ConnectionCallHandler {
 
 // MARK: - CC Message Constants
 
-/// The 8-char message field values used in CC packets
+/// 2-char message field values — kept short to stay within the
+/// iOS BLE local name 26-byte hard limit.
+/// Full CC packet: O9CC(4) + -(1) + Name≤10(10) + -(1) + FromID(6) + -(1) + ToID(6) + -(1) + Msg(2) = 32...
+/// With name trimmed to 4 and msg to 2: 4+1+4+1+6+1+6+1+2 = 26 ✓
 enum CCMessage: String {
-    case request = "CONNREQ0"   // Connection request
-    case accept  = "CONNACC0"   // Connection accepted
-    case reject  = "CONNREJ0"   // Connection rejected
+    case request = "RQ"   // Connection request
+    case accept  = "AC"   // Connection accepted
+    case reject  = "RJ"   // Connection rejected
 }
 
 private enum CCIntent {

@@ -11,14 +11,14 @@ import Foundation
 // MARK: - Parsed Packet Types
 
 /// A discovery broadcast packet (O9BB)
-/// Format: O9BB-<Name 10>-<Bio 11>-<HexID 6>
-/// Total string length: 4 + 1 + 10 + 1 + 11 + 1 + 6 = 34 chars
+/// Format: O9BB-<Name 10>-<Bio 8>-<AsciiID 6>
+/// Total string length: 4 + 1 + 10 + 1 + 8 + 1 + 6 = 31 chars
 struct BBPacket {
     let appUUID: String   // "O9"
     let type: String      // "BB"
     let name: String      // Up to 10 chars (trimmed)
-    let bio: String       // Up to 11 chars (trimmed)
-    let hexID: String     // 6-char hex ID
+    let bio: String       // Up to 8 chars (trimmed)
+    let hexID: String     // 6-char ASCII user ID
 }
 
 /// A connection request/grant packet (O9CC)
@@ -37,7 +37,27 @@ struct CCPacket {
 enum OrbitPacket {
     case broadcast(BBPacket)
     case connection(CCPacket)
+    case eventHost(EEPacket)
+    case eventAttendant(EAPacket)
     case unknown(appUUID: String, type: String)
+}
+
+/// An event host broadcast packet (O9EE)
+/// Format: O9EE-<EventID 6>-<HostID 6>-<Action 6>
+/// Total: 4+1+6+1+6+1+6 = 25 bytes ✓
+struct EEPacket {
+    let eventID: String   // 6-char event identifier
+    let hostID:  String   // 6-char ASCII host user ID
+    let action:  String   // 6-char action code (e.g. "RCALL0", "BLUES0")
+}
+
+/// An event attendant response packet (O9EA)
+/// Format: O9EA-<EventID 6>-<GuestID 6>-<Action 6>
+/// Total: 4+1+6+1+6+1+6 = 25 bytes ✓
+struct EAPacket {
+    let eventID: String   // 6-char event identifier (matches the EE that triggered this)
+    let guestID: String   // 6-char ASCII guest user ID
+    let action:  String   // 6-char action response (e.g. "RCACK0" for roll call ack)
 }
 
 // MARK: - PacketParser
@@ -62,73 +82,134 @@ class PacketParser {
             return parseBB(raw)
         case "CC":
             return parseCC(raw)
+        case "EE":
+            return parseEE(raw)
+        case "EA":
+            return parseEA(raw)
         default:
             return .unknown(appUUID: appUUID, type: packetType)
         }
     }
 
     // MARK: - BB Parser
-    // Format: O9BB-<Name[10]>-<Bio[11]>-<HexID[6]>
-    // Example: "O9BB-Reed      -SwiftUI    -A3B12F"
+    // Format: O9BB-<Name up to 10>-<Bio up to 8>-<AsciiID up to 6>
+    // Example: "O9BB-Reed-Policy-ReedSt"
+    //
+    // We always treat the LAST component as the ID and the SECOND-TO-LAST
+    // as the bio, so a name containing a "-" character doesn't break parsing.
 
     private static func parseBB(_ raw: String) -> OrbitPacket? {
-        // Strip the 4-char header "O9BB" then split on "-"
         guard raw.count >= 4 else { return nil }
-        let body = String(raw.dropFirst(4)) // "-Reed      -SwiftUI    -A3B12F"
+        let body = String(raw.dropFirst(4)) // "-Reed-Policy-ReedSt"
 
-        // Expected: ["", "Reed      ", "SwiftUI    ", "A3B12F"]
-        let parts = body.components(separatedBy: "-")
+        var parts = body.components(separatedBy: "-")
 
-        // We need at least 4 parts (leading empty + name + bio + id)
-        guard parts.count >= 4 else { return nil }
+        // Drop the leading empty string from the opening "-"
+        if parts.first == "" { parts.removeFirst() }
 
-        let name  = parts[1].trimmingCharacters(in: .whitespaces)
-        let bio   = parts[2].trimmingCharacters(in: .whitespaces)
-        let hexID = parts[3].trimmingCharacters(in: .whitespaces)
+        // Need at least 3 components: name, bio, id
+        guard parts.count >= 3 else { return nil }
 
-        guard hexID.count == 6 else { return nil }
+        // ID is always the last component, bio always second-to-last,
+        // everything before that joins back as the name (handles "-" in names)
+        let asciiID = parts[parts.count - 1].trimmingCharacters(in: .whitespaces)
+        let bio     = parts[parts.count - 2].trimmingCharacters(in: .whitespaces)
+        let name    = parts[0..<(parts.count - 2)]
+                        .joined(separator: "-")
+                        .trimmingCharacters(in: .whitespaces)
 
-        let packet = BBPacket(
+        guard !asciiID.isEmpty, asciiID.count <= 6 else { return nil }
+
+        return .broadcast(BBPacket(
             appUUID: "O9",
             type: "BB",
-            name: name,
-            bio: bio,
-            hexID: hexID
-        )
-
-        return .broadcast(packet)
+            name: String(name.prefix(10)),
+            bio: String(bio.prefix(8)),
+            hexID: asciiID
+        ))
     }
 
     // MARK: - CC Parser
-    // Format: O9CC-<Name[10]>-<FromID[6]>-<ToID[6]>-<Message[8]>
-    // Example: "O9CC-Reed      -A3B12F-B22C91-00000000"
+    // Format: O9CC-<Name up to 10>-<FromID 6>-<ToID 6>-<Message 8>
+    // Example: "O9CC-Lainey-AditiK-ReedSt-CONNREQ0"
+    //
+    // We anchor from the END just like parseBB:
+    //   last       = message
+    //   last - 1   = toID
+    //   last - 2   = fromID
+    //   everything before = fromName (handles "-" in names)
 
     private static func parseCC(_ raw: String) -> OrbitPacket? {
         guard raw.count >= 4 else { return nil }
         let body = String(raw.dropFirst(4))
 
-        // Expected: ["", "Reed      ", "A3B12F", "B22C91", "00000000"]
-        let parts = body.components(separatedBy: "-")
+        var parts = body.components(separatedBy: "-")
+        if parts.first == "" { parts.removeFirst() }
 
-        guard parts.count >= 5 else { return nil }
+        // Need at least 4 components: name, fromID, toID, message
+        guard parts.count >= 4 else { return nil }
 
-        let fromName = parts[1].trimmingCharacters(in: .whitespaces)
-        let fromID   = parts[2].trimmingCharacters(in: .whitespaces)
-        let toID     = parts[3].trimmingCharacters(in: .whitespaces)
-        let message  = parts[4].trimmingCharacters(in: .whitespaces)
+        let message  = parts[parts.count - 1].trimmingCharacters(in: .whitespaces)
+        let toID     = parts[parts.count - 2].trimmingCharacters(in: .whitespaces)
+        let fromID   = parts[parts.count - 3].trimmingCharacters(in: .whitespaces)
+        let fromName = parts[0..<(parts.count - 3)]
+                         .joined(separator: "-")
+                         .trimmingCharacters(in: .whitespaces)
 
-        guard fromID.count == 6, toID.count == 6 else { return nil }
+        guard fromID.count == 6, toID.count == 6 else {
+            print("⚠️ [CC] Parse failed — fromID: '\(fromID)' toID: '\(toID)'")
+            return nil
+        }
 
-        let packet = CCPacket(
+        print("🔬 [CC] Parsed — from: \(fromID) to: \(toID) msg: \(message)")
+
+        return .connection(CCPacket(
             appUUID: "O9",
             type: "CC",
             fromName: fromName,
             fromID: fromID,
             toID: toID,
-            message: message.isEmpty ? "00000000" : message
-        )
+            message: message.isEmpty ? "RQ" : message
+        ))
+    }
+    // MARK: - EE Parser
+    // Format: O9EE-<EventID 6>-<HostID 6>-<Action 6>
+    // Example: "O9EE-EVT001-ReedSt-RCALL0"
 
-        return .connection(packet)
+    private static func parseEE(_ raw: String) -> OrbitPacket? {
+        guard raw.count >= 4 else { return nil }
+        var parts = String(raw.dropFirst(4)).components(separatedBy: "-")
+        if parts.first == "" { parts.removeFirst() }
+        guard parts.count >= 3 else { return nil }
+
+        let action  = parts[parts.count - 1].trimmingCharacters(in: .whitespaces)
+        let hostID  = parts[parts.count - 2].trimmingCharacters(in: .whitespaces)
+        let eventID = parts[parts.count - 3].trimmingCharacters(in: .whitespaces)
+
+        guard eventID.count <= 6, hostID.count == 6, !action.isEmpty else { return nil }
+
+        print("🔬 [EE] Parsed — event: \(eventID) host: \(hostID) action: \(action)")
+        return .eventHost(EEPacket(eventID: eventID, hostID: hostID, action: action))
+    }
+
+    // MARK: - EA Parser
+    // Format: O9EA-<EventID 6>-<GuestID 6>-<Action 6>
+    // Example: "O9EA-EVT001-AditiK-RCACK0"
+
+    private static func parseEA(_ raw: String) -> OrbitPacket? {
+        guard raw.count >= 4 else { return nil }
+        var parts = String(raw.dropFirst(4)).components(separatedBy: "-")
+        if parts.first == "" { parts.removeFirst() }
+        guard parts.count >= 3 else { return nil }
+
+        let action  = parts[parts.count - 1].trimmingCharacters(in: .whitespaces)
+        let guestID = parts[parts.count - 2].trimmingCharacters(in: .whitespaces)
+        let eventID = parts[parts.count - 3].trimmingCharacters(in: .whitespaces)
+
+        guard eventID.count <= 6, guestID.count == 6, !action.isEmpty else { return nil }
+
+        print("🔬 [EA] Parsed — event: \(eventID) guest: \(guestID) action: \(action)")
+        return .eventAttendant(EAPacket(eventID: eventID, guestID: guestID, action: action))
     }
 }
 
@@ -137,23 +218,35 @@ class PacketParser {
 class PacketBuilder {
 
     // MARK: BB Packet
-    /// Builds a 34-char discovery broadcast string
-    /// O9BB-<Name[10]>-<Bio[11]>-<HexID[6]>
-    static func buildBB(name: String, bio: String, hexID: String) -> String {
-        let paddedName  = name.padding(toLength: 10, withPad: " ", startingAt: 0).prefix(10)
-        let paddedBio   = bio.padding(toLength: 11, withPad: " ", startingAt: 0).prefix(11)
-        let safeHexID   = hexID.prefix(6)
-        return "O9BB-\(paddedName)-\(paddedBio)-\(safeHexID)"
+    /// Builds a delimiter-separated discovery broadcast string
+    /// O9BB-<Name up to 10>-<Bio up to 8>-<AsciiID up to 6>
+    static func buildBB(name: String, bio: String, asciiID: String) -> String {
+        let safeName = String(name.prefix(10))
+        let safeBio  = String(bio.prefix(8))
+        let safeID   = String(asciiID.prefix(6))
+        return "O9BB-\(safeName)-\(safeBio)-\(safeID)"
     }
 
     // MARK: CC Packet
-    /// Builds a 38-char connection request string
-    /// O9CC-<Name[10]>-<FromID[6]>-<ToID[6]>-<Message[8]>
-    static func buildCC(fromName: String, fromID: String, toID: String, message: String = "00000000") -> String {
-        let paddedName    = fromName.padding(toLength: 10, withPad: " ", startingAt: 0).prefix(10)
-        let safeFromID    = fromID.prefix(6)
-        let safeToID      = toID.prefix(6)
-        let paddedMessage = message.padding(toLength: 8, withPad: "0", startingAt: 0).prefix(8)
-        return "O9CC-\(paddedName)-\(safeFromID)-\(safeToID)-\(paddedMessage)"
+    /// CC packet — hard budget of 26 bytes (iOS BLE local name limit):
+    /// O9CC(4) + -(1) + Name≤4(4) + -(1) + FromID(6) + -(1) + ToID(6) + -(1) + Msg(2) = 26
+    static func buildCC(fromName: String, fromID: String, toID: String, message: String = "RQ") -> String {
+        let safeName    = String(fromName.trimmingCharacters(in: .whitespaces).prefix(4))
+        let safeFromID  = String(fromID.prefix(6))
+        let safeToID    = String(toID.prefix(6))
+        let safeMessage = String(message.prefix(2))
+        return "O9CC-\(safeName)-\(safeFromID)-\(safeToID)-\(safeMessage)"
+    }
+
+    // MARK: EE Packet
+    /// O9EE(4) + -(1) + EventID≤6(6) + -(1) + HostID(6) + -(1) + Action≤6(6) = 25 ✓
+    static func buildEE(eventID: String, hostID: String, action: String) -> String {
+        return "O9EE-\(String(eventID.prefix(6)))-\(String(hostID.prefix(6)))-\(String(action.prefix(6)))"
+    }
+
+    // MARK: EA Packet
+    /// O9EA(4) + -(1) + EventID≤6(6) + -(1) + GuestID(6) + -(1) + Action≤6(6) = 25 ✓
+    static func buildEA(eventID: String, guestID: String, action: String) -> String {
+        return "O9EA-\(String(eventID.prefix(6)))-\(String(guestID.prefix(6)))-\(String(action.prefix(6)))"
     }
 }

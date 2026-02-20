@@ -1,16 +1,30 @@
 {
-  "A3B12F": {
-    "id": "A3B12F",
+  "ReedSt": {
+    "id": "ReedSt",
     "name": "Reed Stewart",
-    "bio": "CMU Heinz Grad | Public Policy & IS",
+    "bio": "CMU Heinz | Policy & IS",
     "techStack": ["SwiftUI", "C#", "NoSQL"],
     "linkedIn": "linkedin.com/in/reedstewart"
   },
-  "B22C91": {
-    "id": "B22C91",
-    "name": "Aditi",
+  "AditiK": {
+    "id": "AditiK",
+    "name": "Aditi Kumar",
     "bio": "Product Designer @ Orbit",
     "techStack": ["Figma", "React", "Python"],
-    "linkedIn": "linkedin.com/in/aditi-designer"
+    "linkedIn": "linkedin.com/in/aditi-k"
+  },
+  "MarcuL": {
+    "id": "MarcuL",
+    "name": "Marcus Lee",
+    "bio": "ML Eng @ Carnegie",
+    "techStack": ["PyTorch", "Python", "Rust"],
+    "linkedIn": "linkedin.com/in/marcus-l"
+  },
+  "SophiR": {
+    "id": "SophiR",
+    "name": "Sophie R",
+    "bio": "FullStack @ Duolingo",
+    "techStack": ["TypeScript", "Go", "PostgreSQL"],
+    "linkedIn": "linkedin.com/in/sophie-r"
   }
 }

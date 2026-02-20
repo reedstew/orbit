@@ -4,22 +4,18 @@
 //
 //  Handles incoming BB (Basic Broadcast) packets.
 //
-//  Flow:
-//    1. Parse BB packet → write raw NearbyProfile to buffer immediately (fast, always works)
-//    2. If WiFi available → fire async API lookup → upgrade to EnrichedProfile in buffer
-//    3. If WiFi unavailable → leave raw profile in place (BLE name + bio only)
+//  RSSI update policy:
+//    - The profile buffer is written on EVERY signal → RSSI stays live
+//    - The enrichment API call fires only ONCE per userID per session
+//      (ProfileAPIService has its own session cache, so duplicate calls
+//       are free, but we skip the Task entirely after first success)
 //
 
 import Foundation
 
 // MARK: - Enrichment Delegate
 
-/// BLEManager implements this so the handler can push enriched profiles back
-/// without holding a reference to the whole manager.
 protocol BBEnrichmentDelegate: AnyObject {
-    /// Called on the main thread when an API lookup completes successfully.
-    /// The handler for this should replace the existing NearbyProfile in the buffer
-    /// with the enriched version.
     func didEnrichProfile(_ enriched: EnrichedProfile)
 }
 
@@ -29,65 +25,80 @@ class BasicBroadcastHandler {
 
     weak var enrichmentDelegate: BBEnrichmentDelegate?
 
-    // MARK: - Incoming: Handle a parsed BB packet
+    /// Tracks which userIDs have already had an enrichment Task fired this session.
+    /// Prevents spawning a new Task on every RSSI update (which can be many per second).
+    private var enrichmentAttempted: Set<String> = []
 
-    /// Writes the raw profile immediately, then fires an async enrichment if WiFi is up.
-    /// - Parameters:
-    ///   - packet: Parsed BBPacket from PacketParser
-    ///   - rssi: Signal strength in dBm
-    ///   - buffer: Shared NearbyProfile store (inout — written immediately on calling thread)
+    // MARK: - Incoming
+
     func handle(packet: BBPacket, rssi: Int, buffer: inout [UUID: NearbyProfile]) {
         let stableID = packet.hexID.toStableUUID()
 
-        // --- Step 1: Write raw BLE profile immediately ---
-        // This ensures the person appears in the UI with zero latency,
-        // even before (or if) the API call resolves.
-        let rawProfile = NearbyProfile(
+        // Always write the latest RSSI — this is what keeps the radar live.
+        // If the profile already exists we preserve the name/bio from the
+        // first packet and just update signal strength.
+        let existing = buffer[stableID]
+        let profile = NearbyProfile(
             id: stableID,
             hexID: packet.hexID,
-            name: packet.name,
-            details: packet.bio,
+            name: existing?.name ?? packet.name,
+            details: existing?.details ?? packet.bio,
             rssi: rssi
         )
-        buffer[stableID] = rawProfile
+        buffer[stableID] = profile
 
-        print("📡 [BB] Raw profile buffered: [\(packet.hexID)] \"\(packet.name)\" at \(rssi) dBm")
+        print("📡 [BB] [\(packet.hexID)] \"\(profile.name)\" \(rssi) dBm")
 
-        // --- Step 2: Attempt async enrichment if WiFi is available ---
-        guard NetworkMonitor.shared.isOnWifi else {
-            print("📵 [BB] No WiFi — showing BLE-only data for \(packet.hexID)")
+        // Only attempt enrichment for confirmed connections
+        guard ConnectionsStore.shared.isConnected(to: packet.hexID) else {
+            print("🔒 [BB] \(packet.hexID) not a connection — showing BLE data only")
             return
         }
 
-        // Capture what we need (don't hold inout buffer reference across async boundary)
-        let capturedProfile = rawProfile
-        let delegate = enrichmentDelegate
+        // Only fire the API Task once per session per userID
+        guard !enrichmentAttempted.contains(packet.hexID) else { return }
+        guard NetworkMonitor.shared.isOnWifi else {
+            print("📵 [BB] No WiFi — BLE-only for \(packet.hexID)")
+            return
+        }
 
+        enrichmentAttempted.insert(packet.hexID)
+
+        let capturedProfile = profile
+        let delegate = enrichmentDelegate
         Task {
             await enrich(profile: capturedProfile, delegate: delegate)
         }
     }
 
-    // MARK: - Outgoing: Build a BB payload string
+    // MARK: - Outgoing
 
-    /// Constructs the outgoing BB advertisement string.
-    /// Format: O9BB-<Name[10]>-<Bio[11]>-<HexID[6]>
-    func buildPayload(name: String, bio: String, hexID: String) -> String {
-        return PacketBuilder.buildBB(name: name, bio: bio, hexID: hexID)
+    func buildPayload(name: String, bio: String, asciiID: String) -> String {
+        return PacketBuilder.buildBB(name: name, bio: bio, asciiID: asciiID)
     }
 
-    // MARK: - Private: Async Enrichment
+    /// Called immediately after a connection is confirmed so the UI updates
+    /// without waiting for the next BB signal cycle.
+    func enrichIfConnected(profile: NearbyProfile, delegate: BBEnrichmentDelegate?) async {
+        guard ConnectionsStore.shared.isConnected(to: profile.hexID) else { return }
+        guard NetworkMonitor.shared.isOnWifi else { return }
+        enrichmentAttempted.insert(profile.hexID)
+        await enrich(profile: profile, delegate: delegate)
+    }
+
+    // MARK: - Private
 
     private func enrich(profile: NearbyProfile, delegate: BBEnrichmentDelegate?) async {
         print("🔍 [API] Fetching full profile for \(profile.hexID)...")
 
         guard let apiData = await ProfileAPIService.shared.tryFetchProfile(hexID: profile.hexID) else {
             print("❓ [API] No profile found for \(profile.hexID) — keeping BLE data")
+            // Remove from attempted so WiFi coming online later can retry
+            enrichmentAttempted.remove(profile.hexID)
             return
         }
 
         let enriched = EnrichedProfile(from: profile, apiData: apiData)
-
         await MainActor.run {
             delegate?.didEnrichProfile(enriched)
             print("⬆️  [API] Enriched \(profile.hexID): \(enriched.displayName) | \(enriched.techStack?.joined(separator: ", ") ?? "no stack")")
