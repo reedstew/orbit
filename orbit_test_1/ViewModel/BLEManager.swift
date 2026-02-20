@@ -410,6 +410,13 @@ class BLEManager: NSObject, ObservableObject,
             guard let self = self else { return }
             let sorted = self.profileBuffer.values.sorted { $0.rssi > $1.rssi }
             self.discoveredProfiles = Array(sorted.prefix(10))
+
+            // Keep enrichedProfiles RSSI in sync so distance labels stay live
+            for profile in sorted {
+                if let existing = self.enrichedProfiles[profile.hexID], existing.rssi != profile.rssi {
+                    self.enrichedProfiles[profile.hexID] = existing.withUpdatedRSSI(profile.rssi)
+                }
+            }
         }
     }
 }

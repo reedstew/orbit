@@ -50,10 +50,7 @@ class BasicBroadcastHandler {
         print("📡 [BB] [\(packet.hexID)] \"\(profile.name)\" \(rssi) dBm")
 
         // Only attempt enrichment for confirmed connections
-        guard ConnectionsStore.shared.isConnected(to: packet.hexID) else {
-            print("🔒 [BB] \(packet.hexID) not a connection — showing BLE data only")
-            return
-        }
+        guard ConnectionsStore.shared.isConnected(to: packet.hexID) else { return }
 
         // Only fire the API Task once per session per userID
         guard !enrichmentAttempted.contains(packet.hexID) else { return }
