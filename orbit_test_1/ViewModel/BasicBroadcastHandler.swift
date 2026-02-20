@@ -2,44 +2,51 @@
 //  BasicBroadcastHandler.swift
 //  orbit_test_1
 //
-//  Created by Reed Stewart on 2/20/26.
+//  Handles incoming BB (Basic Broadcast) packets and outgoing BB payload construction.
 //
 
 import Foundation
 
 class BasicBroadcastHandler {
-    
-    // MARK: - Outgoing: Payload Preparation
-    
-    /// Constructs the 31-byte delimited packet for discovery
-    func preparePayload(name: String, bio: String, hexID: String) -> Data {
-        let header = "O9BB"
-        let paddedName = name.padding(toLength: 10, withPad: " ", startingAt: 0)
-        let paddedBio = bio.padding(toLength: 11, withPad: " ", startingAt: 0)
-        
-        // Combine the string parts: O9BB-Name-Bio-
-        let stringPart = "\(header)-\(paddedName)-\(paddedBio)-"
-        var packetData = stringPart.data(using: .utf8)!
-        
-        // Append the 3 raw hex bytes (The full ID)
-        let rawIDBytes = hexToData(hexID)
-        packetData.append(rawIDBytes)
-        
-        return packetData // Now 31 bytes of Data
-    }
-    
-    // MARK: - Incoming: Signal Handling
-    
-    func handle(packet: ParsedPacket, rssi: Int, buffer: inout [UUID: NearbyProfile]) {
-        let stableID = packet.part2.toStableUUID()
-        
+
+    // MARK: - Incoming: Handle a parsed BB packet
+
+    /// Called by BLEManager when a BB packet arrives.
+    /// Creates or updates a NearbyProfile in the shared buffer.
+    /// - Parameters:
+    ///   - packet: The parsed BBPacket from PacketParser
+    ///   - rssi: Signal strength in dBm (used for distance positioning)
+    ///   - buffer: Shared in-memory profile store (passed inout from BLEManager)
+    func handle(packet: BBPacket, rssi: Int, buffer: inout [UUID: NearbyProfile]) {
+        // Generate a stable UUID from the sender's 6-char Hex ID.
+        // Using the Hex ID (not the name) ensures the same person
+        // always maps to the same UUID even if their name changes.
+        let stableID = packet.hexID.toStableUUID()
+
         let profile = NearbyProfile(
             id: stableID,
-            name: packet.part1,
-            details: packet.part3,
+            name: packet.name,
+            details: packet.bio,
             rssi: rssi
         )
-        
+
+        // Writing to the dict by stableID naturally deduplicates:
+        // a new signal from the same person just overwrites the old one.
         buffer[stableID] = profile
+
+        print("📡 [BB] Discovered: [\(packet.hexID)] \"\(packet.name)\" at \(rssi) dBm | Bio: \"\(packet.bio)\"")
+    }
+
+    // MARK: - Outgoing: Build a BB payload string
+
+    /// Constructs the outgoing BB advertisement string.
+    /// Format: O9BB-<Name[10]>-<Bio[11]>-<HexID[6]>
+    /// - Parameters:
+    ///   - name: The broadcaster's display name (truncated to 10 chars)
+    ///   - bio: The broadcaster's bio/tech stack (truncated to 11 chars)
+    ///   - hexID: The broadcaster's stable 6-char Hex ID
+    /// - Returns: A properly formatted 34-char string ready to broadcast
+    func buildPayload(name: String, bio: String, hexID: String) -> String {
+        return PacketBuilder.buildBB(name: name, bio: bio, hexID: hexID)
     }
 }

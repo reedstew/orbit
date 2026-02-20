@@ -1,208 +1,273 @@
+//
+//  BLEManager.swift
+//  orbit_test_1
+//
+//  Central orchestrator for all Bluetooth scanning and broadcasting.
+//  Routes parsed packets to the appropriate sub-handler.
+//
+
 import Foundation
 import SwiftUI
 import CoreBluetooth
 import Combine
 
-// 1. Define the struct OUTSIDE the class so it is globally accessible
-struct NearbyProfile: Identifiable {
-    let id: UUID
-    let name: String
-    let details: String
-    let rssi: Int
-}
+// MARK: - BLEManager
 
-class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralManagerDelegate {
-    
-    // MARK: - Hardware Managers
+class BLEManager: NSObject, ObservableObject,
+                  CBCentralManagerDelegate,
+                  CBPeripheralManagerDelegate,
+                  ConnectionCallDelegate {
+
+    // MARK: - Hardware
     var centralManager: CBCentralManager!
     var peripheralManager: CBPeripheralManager!
-    
+
     // MARK: - Published UI State
-    @Published var isBluetoothOn = false
-    @Published var isBroadcasting = false
-    @Published var isScanning = false
-    @Published var discoveredProfiles: [NearbyProfile] = []
-    @Published var currentMode: AppMode = .personal
-    
+    @Published var isBluetoothOn        = false
+    @Published var isBroadcasting       = false
+    @Published var isScanning           = false
+    @Published var discoveredProfiles:    [NearbyProfile] = []
+
+    /// Set when an inbound connection request arrives — drives a sheet/alert in the UI
+    @Published var pendingConnectionRequest: CCPacket? = nil
+
     // MARK: - Internal Storage
     private var profileBuffer: [UUID: NearbyProfile] = [:]
     private var uiUpdateTimer: Timer?
-    
-    // Sub-Controllers
-    private let discoveryHandler = BasicBroadcastHandler()
-    private let connectionHandler = ConnectionCallHandler()
-    
-    // Cache to prevent duplicate processing (The 30-minute rule)
+    private var cacheCleanupTimer: Timer?
+
+    // MARK: - Sub-Handlers
+    private let bbHandler = BasicBroadcastHandler()
+    private lazy var ccHandler: ConnectionCallHandler = {
+        let handler = ConnectionCallHandler(myHexID: myHexID)
+        handler.delegate = self
+        return handler
+    }()
+
+    // MARK: - Signal Dedup Cache (BB — 30-minute rule)
+    // Key: raw advertisement string, Value: time last seen
     private var signalCache: [String: Date] = [:]
-    
-    // Protocol Constants
+
+    // MARK: - Protocol Constants
     let eventServiceUUID = CBUUID(string: "12345678-1234-1234-1234-1234567890AB")
-    let myHexID = "A3B12F" // Your stable 6-char hex ID
-    let appUUID = "O9"  // Your custom app identifier
-    
-    enum AppMode { case personal, events }
+    let myHexID  = "A3B12F"   // This device's stable 6-char Hex ID
+    let appUUID  = "O9"       // Orbit app identifier prefix
+
+    // MARK: - Init
 
     override init() {
         super.init()
-        centralManager = CBCentralManager(delegate: self, queue: nil)
+        centralManager   = CBCentralManager(delegate: self, queue: nil)
         peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
     }
 
-    // MARK: - 1. Scanner Logic (Central)
-    
+    // MARK: - 1. Scanner (Central)
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         isBluetoothOn = central.state == .poweredOn
-        if isBluetoothOn {
-            startScanning()
-        } else {
-            stopScanning()
-        }
+        if isBluetoothOn { startScanning() } else { stopScanning() }
     }
 
     func startScanning() {
         guard centralManager.state == .poweredOn else { return }
-        print("Orbit Scanner Starting...")
-        
+        print("🔍 Orbit Scanner Starting...")
+
         centralManager.scanForPeripherals(
             withServices: [eventServiceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
         isScanning = true
-        
-        // Refresh UI from buffer once per second to prevent main-thread hangs
+
+        // Flush the buffer to UI once per second
         uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.flushBufferToUI()
+        }
+
+        // Clean up the CC connection cache every 10 minutes
+        cacheCleanupTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
+            self?.ccHandler.purgeExpiredCache()
         }
     }
 
     func stopScanning() {
-        print("Orbit Scanner Stopping...")
+        print("🛑 Orbit Scanner Stopping...")
         centralManager.stopScan()
         isScanning = false
-        uiUpdateTimer?.invalidate()
-        uiUpdateTimer = nil
+        uiUpdateTimer?.invalidate();    uiUpdateTimer = nil
+        cacheCleanupTimer?.invalidate(); cacheCleanupTimer = nil
         profileBuffer.removeAll()
         discoveredProfiles.removeAll()
     }
 
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+    func centralManager(_ central: CBCentralManager,
+                        didDiscover peripheral: CBPeripheral,
+                        advertisementData: [String: Any],
+                        rssi RSSI: NSNumber) {
         guard let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String else { return }
-        
-        // 1. Filtering Logic: Skip if seen in last 30 mins
-        if let lastSeen = signalCache[localName], Date().timeIntervalSince(lastSeen) < 1800 { return }
-        signalCache[localName] = Date()
-        
-        // 2. Route to the internal signal handler
+
+        // BB dedup: ignore same string seen within 30 minutes
+        // (CC packets use their own cache inside ConnectionCallHandler)
+        if localName.hasPrefix("O9BB") {
+            if let lastSeen = signalCache[localName],
+               Date().timeIntervalSince(lastSeen) < 1800 { return }
+            signalCache[localName] = Date()
+        }
+
         handleIncomingSignal(localName, rssi: RSSI.intValue)
     }
 
-    // MARK: - 2. Broadcaster Logic (Peripheral)
-    
+    // MARK: - 2. Broadcaster (Peripheral)
+
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
-        // Required delegate method; state handled via centralManager for simplicity
+        // State mirrored via centralManager; nothing extra needed here
     }
 
+    /// Toggle broadcasting on/off using the user's current name, bio, and this device's Hex ID.
     func toggleBroadcasting(myName: String, myBio: String) {
         if isBroadcasting {
             peripheralManager.stopAdvertising()
             isBroadcasting = false
+            print("📴 Broadcasting stopped")
         } else {
-            let header = "O9BB"
-            
-            // Ensure name is exactly 10 and bio is exactly 11 bytes
-            let paddedName = myName.padding(toLength: 10, withPad: " ", startingAt: 0)
-            let paddedBio = myBio.padding(toLength: 11, withPad: " ", startingAt: 0)
-            
-            // Your 6-char Hex ID represented as 3 bytes/chars (e.g., "A3B")
-            let shortID = String(myHexID.prefix(3))
-            
-            // Final Format: O9BB-Name      -Bio        -ID
-            let payload = "\(header)-\(paddedName)-\(paddedBio)-\(shortID)"
-            
+            let payload = bbHandler.buildPayload(name: myName, bio: myBio, hexID: myHexID)
             broadcastSignal(payload)
             isBroadcasting = true
         }
     }
 
     func broadcastSignal(_ payload: String, forDuration duration: TimeInterval? = nil) {
-        guard peripheralManager.state == .poweredOn else { return }
-        
+        guard peripheralManager.state == .poweredOn else {
+            print("⚠️ Cannot broadcast — peripheral manager not powered on")
+            return
+        }
+
         if peripheralManager.isAdvertising { peripheralManager.stopAdvertising() }
-        
+
         let advertisementData: [String: Any] = [
             CBAdvertisementDataLocalNameKey: payload,
             CBAdvertisementDataServiceUUIDsKey: [eventServiceUUID]
         ]
-        
+
         peripheralManager.startAdvertising(advertisementData)
-        print("📣 Orbit Broadcasting: \(payload)")
-        
+        print("📣 Broadcasting: \(payload)")
+
         if let duration = duration {
-            DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
-                self.peripheralManager.stopAdvertising()
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+                self?.peripheralManager.stopAdvertising()
             }
         }
     }
 
-    // MARK: - 3. Signal & Data Processing
-    
+    // MARK: - 3. Signal Routing
+
+    /// Parse and route any incoming BLE advertisement string.
     func handleIncomingSignal(_ rawString: String, rssi: Int) {
-            guard let packet = PacketParser.parse(rawString) else { return }
-            guard packet.appUUID == appUUID else { return }
-            
-            switch packet.type {
-            case "BB":
-                // Delegate the discovery logic to the specialized handler
-                // 'inout' allows the handler to modify the buffer directly
-                discoveryHandler.handle(packet: packet, rssi: rssi, buffer: &profileBuffer)
-                
-            case "CC":
-                // connectionHandler.handleRequest(packet, myID: myHexID)
-                print("Connection Request Logic Handled Here")
-                
-            default:
-                print("Unhandled signal type: \(packet.type)")
-            }
+        guard let packet = PacketParser.parse(rawString) else {
+            print("⚠️ Could not parse: \(rawString)")
+            return
         }
-    
-    private func updateOrbitMap(userId: String, rssi: Int) {
-        // 1. Resolve Hex ID to a full Profile from our JSON "API"
-        if let profileData = JSONManager.shared.fetchProfile(for: userId) {
-            
-            let stableID = userId.toStableUUID()
-            
-            let profile = NearbyProfile(
-                id: stableID,
-                name: profileData.name,
-                details: profileData.bio, // Now using the real bio from JSON
-                rssi: rssi
-            )
-            
-            profileBuffer[stableID] = profile
-        } else {
-            // Fallback if the user isn't in our hardcoded list
-            print("❓ Unknown Hex ID discovered: \(userId)")
+
+        switch packet {
+
+        case .broadcast(let bbPacket):
+            // Hand off to BasicBroadcastHandler — updates the profile buffer
+            bbHandler.handle(packet: bbPacket, rssi: rssi, buffer: &profileBuffer)
+
+        case .connection(let ccPacket):
+            // Hand off to ConnectionCallHandler — checks if addressed to us, updates cache
+            ccHandler.handle(packet: ccPacket)
+
+        case .unknown(let appUUID, let type):
+            print("❓ Unknown packet type: \(appUUID)\(type)")
         }
     }
 
-    private func performActionAndRepeat(payload: String) {
-        // Trigger UI feedback then repeat broadcast for 2 seconds to facilitate epidemic spread
-        broadcastSignal(payload, forDuration: 2.0)
+    // MARK: - 4. Connection Actions (called from UI)
+
+    /// Initiate a connection request to a nearby user
+    func sendConnectionRequest(to profile: NearbyProfile, myName: String) {
+        // Reverse-map UUID → HexID by scanning the buffer
+        guard let hexID = hexIDFor(profile: profile) else {
+            print("⚠️ Could not find Hex ID for \(profile.name)")
+            return
+        }
+        ccHandler.sendConnectionRequest(myName: myName, toHexID: hexID)
     }
+
+    /// Accept an inbound connection request
+    func acceptConnectionRequest(from packet: CCPacket, myName: String) {
+        ccHandler.acceptConnectionRequest(myName: myName, toHexID: packet.fromID)
+        pendingConnectionRequest = nil
+    }
+
+    /// Reject an inbound connection request
+    func rejectConnectionRequest(from packet: CCPacket, myName: String) {
+        ccHandler.rejectConnectionRequest(myName: myName, toHexID: packet.fromID)
+        pendingConnectionRequest = nil
+    }
+
+    // MARK: - 5. ConnectionCallDelegate
+
+    func didReceiveConnectionRequest(from packet: CCPacket) {
+        DispatchQueue.main.async { [weak self] in
+            print("🤝 Connection request from \(packet.fromName) (\(packet.fromID))")
+            self?.pendingConnectionRequest = packet
+        }
+    }
+
+    func didReceiveConnectionConfirmation(from packet: CCPacket) {
+        DispatchQueue.main.async {
+            print("🎉 Connection confirmed with \(packet.fromName) (\(packet.fromID))")
+            // TODO: Load full profile from JSONManager and present it
+            if let fullProfile = JSONManager.shared.fetchProfile(for: packet.fromID) {
+                print("✅ Full profile loaded: \(fullProfile.name) — \(fullProfile.bio)")
+            }
+        }
+    }
+
+    func broadcastConnectionPacket(_ payload: String) {
+        // Broadcast 3 times with a short gap to improve receipt reliability
+        broadcastSignal(payload, forDuration: 0.5)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.broadcastSignal(payload, forDuration: 0.5)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.broadcastSignal(payload, forDuration: 0.5)
+        }
+    }
+
+    // MARK: - Private Helpers
 
     private func flushBufferToUI() {
-        DispatchQueue.main.async {
-            // Depict 10 closest persons
-            let sorted = self.profileBuffer.values.sorted(by: { $0.rssi > $1.rssi })
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let sorted = self.profileBuffer.values.sorted { $0.rssi > $1.rssi }
             self.discoveredProfiles = Array(sorted.prefix(10))
         }
     }
-    
-    // MARK: - 4. Packet Construction
-    
-    func constructPacket(type: String, toID: String, fromID: String) -> String {
-        let randomPadding = String(format: "%02d", Int.random(in: 0...99))
-        // Format: 0r61t-BB-A3B12F-A3B12F00 (29 bytes)
-        return "\(appUUID)-\(type)-\(toID)-\(fromID)\(randomPadding)"
+
+    /// Retrieve the original HexID for a NearbyProfile by matching its stableID
+    private func hexIDFor(profile: NearbyProfile) -> String? {
+        // The profile's UUID was generated from a HexID via toStableUUID().
+        // We find it by checking all known profiles in the JSONManager.
+        // For profiles not in JSON (discovered via BLE only), we can't recover the raw HexID
+        // unless we store it explicitly — see note below.
+        //
+        // TODO: Store hexID directly on NearbyProfile for cleaner reverse lookup.
+        return nil
     }
 }
+
+// MARK: - NearbyProfile HexID Extension
+// To properly support sendConnectionRequest, store hexID on the profile.
+// Update NearbyProfile to:
+//
+//   struct NearbyProfile: Identifiable {
+//       let id: UUID
+//       let hexID: String   // ← ADD THIS
+//       let name: String
+//       let details: String
+//       let rssi: Int
+//   }
+//
+// Then update BasicBroadcastHandler.handle() to pass packet.hexID when constructing the profile.
